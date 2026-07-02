@@ -1,6 +1,6 @@
-# Mini RFC — Pagos de Tutorías
+Mini RFC — Pagos de Tutorías
 
-## 1. Contexto
+1. Contexto
 
 El sistema **Tutorías Universitarias** permite que un estudiante solicite una tutoría con un tutor disponible. Hoy, `ms-tutorias` actúa como orquestador de una Saga: valida identidad vía JWT (`ms-auth`), valida estudiante/tutor (`ms-usuarios`), consulta y bloquea agenda (`ms-agenda`), persiste la tutoría, publica una notificación asíncrona (RabbitMQ → `ms-notificaciones`) y, si algo falla después del bloqueo, compensa liberando el bloqueo y marcando la tutoría como `FALLIDA`.
 
@@ -12,16 +12,15 @@ Restricciones relevantes del caso base que debe respetar el nuevo diseño:
 - Ya existe un patrón de cola durable + DLX/DLQ (`notificaciones_email_queue` → `notificaciones_dlx` → `notificaciones_dlq`) que sirve de precedente para cómo aislar mensajes fallidos.
 - Ya existe `X-Correlation-ID` propagado entre servicios y eventos de tracking (`tracking_events_exchange`) — el diseño de pagos debe reusar ese mecanismo, no inventar uno paralelo.
 - El JWT ya coloca la identidad confiable en `sub`; el mismo principio (no confiar en el body para datos sensibles) debe aplicarse a quién puede iniciar un pago.
-
-## 2. Problema
+2. Problema
 
 El diseño propuesto por el equipo es:
 
 ```
 ms-tutorias: BEGIN TRANSACTION
-  → HTTP a ms-pagos
-      → HTTP a proveedor externo (Visa/Mastercard), espera respuesta final
-  ← OK/Error
+  ->HTTP a ms-pagos
+      ->HTTP a proveedor externo (Visa/Mastercard), espera respuesta final
+  <-OK/Error
   guarda tutoría CONFIRMADA
 COMMIT / ROLLBACK
 ```
@@ -37,8 +36,7 @@ Concretamente:
 - **Estados parciales inconsistentes:** puede terminar aprobado el pago sin que exista tutoría (proveedor responde OK tarde, después de que `ms-tutorias` ya abandonó/canceló), o viceversa, una tutoría "confirmada" sin pago realmente capturado.
 - **Difícil diagnóstico:** al no haber estados intermedios explícitos (solo transacción abierta o cerrada), no hay forma de observar "en qué quedó" un pago en curso cuando algo falla a mitad de camino.
 
-
-## 3. Riesgos
+3. Riesgos
 
 | Riesgo | Tipo | Consecuencia |
 | --- | --- | --- |
@@ -54,7 +52,7 @@ Concretamente:
 | Webhook de proveedor sin autenticar/validar | Seguridad | Un tercero podría falsificar confirmaciones de pago |
 
 
-## 4. Diseño propuesto
+4. Diseño propuesto
 
 **Principio central:** ningún proveedor externo debe controlar una transacción local. `ms-tutorias` y `ms-pagos` se comunican de forma **síncrona solo para lo mínimo indispensable** (crear una intención de pago) y el resultado final del pago se resuelve **de forma asíncrona**, vía eventos, igual que hoy se resuelve la notificación.
 
@@ -81,7 +79,7 @@ Concretamente:
 Esto es una **extensión de la Saga orquestada existente**, no una arquitectura nueva: se agrega un paso más al mismo patrón que ya compensa agenda hoy.
 
 
-## 5. Alternativas consideradas
+5. Alternativas consideradas
 
 **Alternativa A — Orquestación síncrona estricta (la rechazada).**
 `ms-tutorias` espera en línea la respuesta final del proveedor dentro de una transacción. Se descarta por las razones de la sección 2: acopla la disponibilidad interna a un tercero, produce estados ambiguos ante timeout y facilita doble cobro.
@@ -98,7 +96,7 @@ Cada servicio reacciona a eventos de los demás sin un coordinador central (`ms-
 **Decisión:** B, con elementos de C solo donde ya existen (notificaciones).
 
 
-## 6. Contratos
+6. Contratos
 
 ### HTTP: `ms-tutorias` → `ms-pagos`
 
@@ -145,7 +143,7 @@ Exchange dedicado, p.ej. `pagos_events_exchange`, análogo al ya existente `trac
 
 Igual patrón que `notificaciones_dlx`/`notificaciones_dlq`: eventos de pago inválidos o rechazados por el consumidor (`nack(false, false)`) van a `pagos_dlq` para inspección manual, con un procedimiento de reconciliación documentado (algo que el propio proyecto reconoce como pendiente para notificaciones y que aquí no debe repetirse como deuda).
 
-## 7. Manejo de fallas
+7. Manejo de fallas
 
 - **Idempotencia end-to-end:** `Idempotency-Key = idTutoria` en la creación de intención de pago. Si `ms-tutorias` reintenta (por timeout de red, no por rechazo real), `ms-pagos` debe devolver el mismo `idIntencionPago` existente en vez de crear una intención nueva. Esto resuelve doble clic/retry/refresh.
 - **Outbox en `ms-tutorias`:** al crear la tutoría `PENDIENTE_PAGO`, la llamada a `ms-pagos` no debe depender de que la petición HTTP saliente tenga éxito en el mismo instante; se registra en una tabla Outbox local (misma transacción que la creación de la tutoría) y un proceso publica de forma confiable, evitando el riesgo ya observado en el propio repo de que `publishToQueue` "retorne sin publicar" si el canal no está listo.
@@ -154,14 +152,14 @@ Igual patrón que `notificaciones_dlx`/`notificaciones_dlq`: eventos de pago inv
 - **Reintentos con backoff:** solo para llamadas idempotentes (creación de intención de pago), con backoff exponencial acotado (p. ej. 3 intentos, 200ms/800ms/2s) y circuit breaker hacia `ms-pagos` — reusando el mismo patrón de Circuit Breaker que el proyecto ya documenta para la llamada `ms-tutorias → ms-usuarios`.
 - **Compensación:** reutiliza el mecanismo ya implementado (`DELETE /bloqueos/{idBloqueo}` + marcar tutoría en estado terminal de fallo), extendiéndolo con el nuevo estado `FALLIDA_PAGO`.
 
-## 8. Observabilidad
+8. Observabilidad
 
 - **Correlation ID:** se propaga el mismo `X-Correlation-ID`/`correlationId` ya usado en el flujo actual, desde la solicitud original hasta los eventos de pago, para poder seguir una tutoría de principio a fin en el dashboard existente.
 - **Métricas clave:** tasa de intenciones de pago creadas vs. resueltas, latencia de resolución (creación → evento final), tasa de `pago.rechazado`/`pago.expirado`, profundidad de `pagos_dlq`, tasa de apertura del circuit breaker hacia `ms-pagos`.
 - **Logs estructurados:** cada transición de estado de tutoría (`PENDIENTE_PAGO` → `CONFIRMADA`/`FALLIDA_PAGO`) se loguea con `correlationId`, `idTutoria`, `idIntencionPago`, sin incluir datos de tarjeta.
 - **Diagnóstico de incidente típico:** "una tutoría quedó en `PENDIENTE_PAGO` más de 10 minutos" → se busca por `correlationId` en el dashboard de tracking, se revisa si hay evento en `pagos_dlq`, se revisa estado en `ms-pagos` por `idIntencionPago`. Esto es posible porque hay estados intermedios explícitos, a diferencia del diseño original donde solo existía "transacción abierta o cerrada".
 
-## 9. Seguridad
+9. Seguridad
 
 - **Límite de confianza:** solo `ms-pagos` conoce datos sensibles de pago (idealmente ni eso: se usa tokenización del lado del proveedor, y `ms-pagos` solo maneja tokens, nunca PAN/CVV en claro). `ms-tutorias` nunca recibe ni reenvía datos de tarjeta.
 - **Autenticación servicio a servicio:** la llamada `ms-tutorias → ms-pagos` usa credenciales de servicio (no el JWT del usuario final), igual que se recomienda formalizar para las demás llamadas internas del sistema (hoy documentado como brecha en `docs/api-security-controls.md`).
@@ -169,14 +167,14 @@ Igual patrón que `notificaciones_dlx`/`notificaciones_dlq`: eventos de pago inv
 - **Webhooks/callbacks del proveedor:** deben validarse con firma/HMAC del proveedor y verificarse contra el `idIntencionPago` esperado; un callback no autenticado nunca debe poder mover el estado de una tutoría.
 - **Secretos:** credenciales del proveedor y claves de firma de webhook viven solo en `ms-pagos`, gestionadas como secretos (no hardcodeadas en compose/manifiestos, brecha que el propio repo ya reconoce para JWT_SECRET y debe evitarse aquí).
 
-## 10. Despliegue y costo
+10. Despliegue y costo
 
 - **Contenedores (como el resto del sistema hoy):** consistente con la operación actual vía Docker Compose/Kubernetes; facilita reusar observabilidad, red interna y patrones ya existentes (RabbitMQ, Circuit Breaker). Costo operativo previsible, pero requiere gestionar escalamiento manual/HPA ante picos.
 - **Serverless para el "consumidor de resultado del proveedor" (callback/webhook):** es un candidato razonable porque el tráfico de callbacks es esporádico y orientado a eventos; escala a cero entre picos y reduce costo cuando no hay actividad. Contras: cold start podría afectar latencia de confirmación y complica pruebas locales end-to-end (el proyecto ya prioriza simplicidad operativa local con Docker Compose).
 - **PaaS gestionado para `ms-pagos`:** razonable si se quiere reducir carga operativa de un servicio con alcance PCI (aprovechar certificaciones/controles del proveedor PaaS), a costo de menor control y posible vendor lock-in.
 - **Recomendación:** mantener el núcleo (`ms-tutorias`, `ms-agenda`, `ms-usuarios`, `ms-notificaciones`, `ms-pagos`) en contenedores, consistente con el resto del ecosistema, y evaluar serverless únicamente para el punto de entrada de callbacks del proveedor si el volumen de picos lo justifica — no migrar todo a serverless solo por seguir una moda, porque el sistema ya está diseñado y operado como microservicios en contenedores.
 
-## 11. Decisión
+11. Decisión
 
 Se adopta el **diseño B**: `ms-tutorias` mantiene su rol de orquestador de la Saga (consistente con el sistema existente), pero la interacción con `ms-pagos` se divide en una llamada síncrona corta (crear intención de pago, con idempotencia) y una resolución asíncrona por eventos (aprobado/rechazado), reutilizando los patrones de cola durable + DLQ, correlation ID y compensación que el sistema ya implementa para agenda y notificaciones.
 
