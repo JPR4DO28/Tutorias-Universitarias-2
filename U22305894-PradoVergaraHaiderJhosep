@@ -56,14 +56,14 @@ Concretamente:
 
 **Principio central:** ningún proveedor externo debe controlar una transacción local. `ms-tutorias` y `ms-pagos` se comunican de forma **síncrona solo para lo mínimo indispensable** (crear una intención de pago) y el resultado final del pago se resuelve **de forma asíncrona**, vía eventos, igual que hoy se resuelve la notificación.
 
-### Responsabilidades por servicio
+Responsabilidades por servicio
 
 - **`ms-tutorias`** (orquestador de la Saga, como ya lo es hoy): crea la tutoría en estado `PENDIENTE_PAGO`, solicita una intención de pago a `ms-pagos`, y reacciona a eventos de resultado de pago (`pago.aprobado` / `pago.rechazado`) para transicionar a `CONFIRMADA` o a compensación. No conoce datos de tarjeta ni detalles del proveedor.
 - **`ms-pagos`**: dueño exclusivo de la relación con proveedores externos (Visa/Mastercard). Expone un endpoint síncrono para *crear una intención de pago* (rápido, no espera al proveedor final) y publica eventos asíncronos cuando el proveedor resuelve (aprobado/rechazado/expirado). Es el único servicio con alcance PCI relevante (idealmente delega la captura de datos de tarjeta a un tokenizador/proveedor, nunca los persiste en texto plano).
 - **`ms-agenda`**: sin cambios de responsabilidad; sigue bloqueando/liberando horarios. El bloqueo se mantiene mientras el pago está pendiente, con expiración.
 - **`ms-notificaciones`**: se integra igual que hoy, mediante los eventos ya existentes, ahora también notificando resultado del pago.
 
-### Flujo principal
+Flujo principal
 
 1. Cliente → `ms-tutorias`: `POST /tutorias` con datos de tutoría (JWT igual que hoy).
 2. `ms-tutorias` valida estudiante/tutor (`ms-usuarios`) y disponibilidad/bloqueo (`ms-agenda`), igual que hoy.
@@ -98,7 +98,7 @@ Cada servicio reacciona a eventos de los demás sin un coordinador central (`ms-
 
 6. Contratos
 
-### HTTP: `ms-tutorias` → `ms-pagos`
+HTTP: `ms-tutorias` → `ms-pagos`
 
 `POST /intenciones-pago`
 
@@ -123,7 +123,7 @@ Errores modelados: `400` (datos inválidos), `401/403` (llamada no autenticada e
 
 Versionamiento: prefijo `/v1/intenciones-pago`; cambios incompatibles (renombrar/eliminar campos requeridos) requieren `/v2`; cambios aditivos (campos opcionales nuevos) no rompen versión.
 
-### Evento: `ms-pagos` → `ms-tutorias` (asíncrono)
+Evento: `ms-pagos` → `ms-tutorias` (asíncrono)
 
 Exchange dedicado, p.ej. `pagos_events_exchange`, análogo al ya existente `tracking_events_exchange`, con cola durable consumida por `ms-tutorias` (patrón ya usado en `notificaciones_email_queue`).
 
@@ -139,7 +139,7 @@ Exchange dedicado, p.ej. `pagos_events_exchange`, análogo al ya existente `trac
 ```
 `tipo` ∈ {`pago.aprobado`, `pago.rechazado`, `pago.expirado`}. Se añade `version` desde el inicio — a diferencia del gap ya identificado en `docs/event-contracts.md` (los eventos de tracking actuales no tienen `version`), aquí se corrige ese pendiente desde el diseño.
 
-### DLQ
+DLQ
 
 Igual patrón que `notificaciones_dlx`/`notificaciones_dlq`: eventos de pago inválidos o rechazados por el consumidor (`nack(false, false)`) van a `pagos_dlq` para inspección manual, con un procedimiento de reconciliación documentado (algo que el propio proyecto reconoce como pendiente para notificaciones y que aquí no debe repetirse como deuda).
 
